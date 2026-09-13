@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# QuPath 项目与本地数据（不入库）
+project.qpproj
+project.qpproj.backup
+data/
+classifiers/
+backup_before_batch/
+
+# 运行产物（体积大，本地生成）
+results/
+qc/
+*.qpdata
+
+# 编辑期临时文件
+_probe*.txt
+*.bak
