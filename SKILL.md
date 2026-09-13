@@ -5,7 +5,8 @@ description: >-
   阳性细胞检测 → 每片一行 CSV + QC 叠加图（组织轮廓 + 阳性细胞）。流程始终跑完并输出结果，
   不因任何检查不通过而中止；另有可信度标注：扫描仪背景色校正（默认色向量假设背景 255，
   实际常为 220–230，不校正会让 DAB OD 整体上移）与分片色向量夹角（小于 20° 时在 CSV 的
-  reliability 列标为 degenerate_angle，提示该片没有可用的 DAB 信号）。附诊断脚本做阈值扫描。
+  reliability 列标为 degenerate_angle，提示该片没有可用的 DAB 信号）。除阳性率外每片另出
+  IOD / MOD（积分与平均光密度）——不依赖阳性阈值的连续指标。附诊断脚本做阈值扫描。
 whenToUse: >-
   用户提出「批量统计组化/免疫组化切片的阳性率」「QuPath 批处理 DAB 阳性细胞」「这批 IHC
   片子阳性率多少」「把组化的阳性率跑出来」，或要在已有 QuPath 项目上批量做组织检测 + 阳性
@@ -161,6 +162,52 @@ for (int i = 0; i < 256; i += 5) {
 判据补充：正常 DAB 阳性细胞的 `Cell: DAB OD mean` 应在 0.3–0.6 量级。
 若 p99 只有 0.20 上下、0.30 以上一个细胞都没有，说明**分布右端是空的**，同样是信号缺失的证据。
 
+## IOD / MOD（积分光密度）
+
+每片除阳性率外另出一组**不依赖阳性阈值**的连续指标：
+
+| 列 | 含义 | 单位 |
+|---|---|---|
+| `IOD` | 积分光密度：组织内全部像素的 DAB 光密度之和 | OD·µm² |
+| `MOD` | 平均光密度 = `IOD` ÷ 组织面积 | OD |
+| `IODpos` / `MODpos` | 只统计像素 OD ≥ `PIXEL_OD_THRESHOLD` 的部分（积分 / 平均） | OD·µm² / OD |
+| `DABareaPct` | 阳性像素面积占比（面密度） | % |
+| `modSE` | `MOD` 的抽样标准误，用来判断抽样够不够 | OD |
+
+**为什么值得看**：IOD 不需要「阳性细胞」这个概念——改 `PIXEL_OD_THRESHOLD` 只影响
+`IODpos`，**完全不影响 `IOD` / `MOD`**。这正好绕开了阳性率那个「阈值切在分布中央」的问题，
+适合直接做组间检验。
+
+**⚠️ 最大的坑：IOD 随组织面积缩放。** 各片组织面积不同时直接比 `IOD` 是不公平的
+（面积大的片天然 IOD 高），要比就比 **`MOD`**（已除掉面积），或把 IOD 归一化到单位面积。
+这是 IOD 最常见的误用。
+
+**实现细节**（影响片间可比性，改前先读）
+
+- **抽样估计**：逐像素遍历整片太慢，改为在组织内随机抽 `IOD_TILES` 个瓦片估计平均 OD、
+  再乘总面积。看 `modSE` 判断抽样是否充分——它应远小于 `MOD`（相对标准误几个百分点以内）
+- **背景校正参与积分**：OD 用校正后的背景算，否则 IOD 会带上固定正偏移
+- **负值截断**：解卷积噪声产生的负 OD 一律记为 0，否则正负相消把积分抹平
+- **近黑像素排除**：`DARK_CUTOFF`（默认灰度 40）。杂质、笔迹、褶皱的解卷积 OD 可超过 2，
+  远超声真实强阳性（约 0.7），几个黑点就能显著拉高 IOD。`darkSkipPct` 列记录被排除的比例，
+  正常片子应接近 0；**若明显大于 0，先去看片子是不是脏了或有褶皱**
+- **OD 查表**：RGB 只有 256 种取值，OD 提前算好查表，省掉每像素 3 次 `log10`（实测快 5 倍以上）
+
+**判读**：IOD/MOD 是连续量，不需要阈值扫描，直接做组间检验即可。但它**同样受色向量夹角约束**
+——`reliability` 为 `degenerate_angle` 的片子，IOD 一样是垃圾进垃圾出。
+
+**实测对照**（上文那 3 张片的同一批数据，数值原样保留）——这张表就是 IOD 值得看的原因：
+
+| 指标 | 片 1 | 片 2 | 片 3 |
+|---|---|---|---|
+| 阳性率 @ 阈值 0.10 | 58.9% | 56.4% | **14.2%** |
+| `MOD`（不依赖阈值） | 0.1213 | 0.1453 | **0.1195** |
+
+阳性率看，片 1 与片 3 差 4 倍；但 `MOD` 看，两者几乎相同（0.1213 vs 0.1195）。
+**同一批数据，换个指标结论就反过来了**——这就是"阳性率的 4 倍差异是阈值假象"的独立验证。
+片 1 与片 3 的 `IOD` 差别（4646833 vs 3729822）主要来自组织面积不同（38.3 vs 31.2 mm²），
+这也正是不要直接比 IOD 的原因。
+
 ## Groovy / QuPath API 坑（实测踩过，照抄可避）
 
 | 现象 | 原因与写法 |
@@ -170,6 +217,7 @@ for (int i = 0; i < 256; i += 5) {
 | 组织面积大得离谱（占全片 1600%） | `ROI.getArea()` 单位是**全分辨率像素²**，要乘 `pixelWidthMicrons * pixelHeightMicrons` 才是 µm² |
 | `No signature of method: getBounds()` | QuPath 的 ROI 没有 `getBounds()` / `getInteriorPoint()`，用 `getBoundsX()/getBoundsY()/getBoundsWidth()/getBoundsHeight()` |
 | `No signature of method: getMeasurementValue(String)` | 0.7 的测量表是 `NumericMeasurementList`，用 `.get(name)` 取值、`.getNames()` 取名字 |
+| 变量名取 `var`，报错行号指向几十行之外的注释行 | `var` 是 Groovy 5 的保留字。改个名（如 `variance`）即可，**别去报错指的那一行找问题**——它指的是解析器放弃的位置，不是出错位置 |
 | 闭包里的变量莫名报 `MissingPropertyException`，且被 catch 吞掉 | Groovy 闭包**不能前向引用**后面才 `def` 的局部变量。闭包定义在变量声明之前就会失败——把该变量当**显式参数**传进去 |
 | `String.format("%d", x)` 抛 `d != java.math.BigDecimal` | Groovy 里 `Integer / Integer` 结果是 BigDecimal。用 `.intdiv()` 或先转 double |
 | 无法用 `def` 作 map key / 属性名 | `def` 是 Groovy 关键字，`[(def): x]`、`m.def` 都编译不过。换名字 |
@@ -183,7 +231,7 @@ for (int i = 0; i < 256; i += 5) {
 
 | 文件 | 内容 |
 |---|---|
-| `results/ihc_summary.csv` | 每片一行：`image, nCells, tissueAreaMM2, nPositive, positiveRate, dabPosThreshold, compartment, nucleusThreshold, tissueThreshold, backgroundRGB, estimatedAngleDeg, elapsedSec`。同一张图重跑会**覆盖旧行**，不产生重复 |
+| `results/ihc_summary.csv` | 每片一行。列分四组：**细胞** `nCells, nPositive, positiveRate`；**IOD** `IOD, MOD, IODpos, MODpos, DABareaPct, pixelODThreshold, iodTiles, darkSkipPct, modSE`；**质控** `estimatedAngleDeg, reliability, backgroundRGB, thresholdSource`；**参数回显** `tissueAreaMM2, dabPosThreshold, compartment, nucleusThreshold, tissueThreshold, elapsedSec`。同一张图重跑会**覆盖旧行**，不产生重复 |
 | `results/qc/<图名>_qc.jpg` | QC 叠加图：绿=自动识别组织轮廓，红=判为阳性的细胞 |
 | `results/qc_probe_<图名>.txt` | 诊断脚本产物：背景众数、色向量夹角、DAB OD 分位数、阈值扫描表 |
 | `data/*.qpdata` | 只有加 `-s` 才写；含注释、细胞与全部测量值，可在 GUI 里改阈值而不重跑检测 |
@@ -199,4 +247,6 @@ for (int i = 0; i < 256; i += 5) {
    只看 CSV 不看图，组织检测切歪了也发现不了
 5. `nCells / tissueAreaMM2`（细胞密度）在同批同组织之间应大致同量级；
    某张片密度差一个数量级，通常是组织检测或细胞检测出问题，不是生物学
-6. 报数时说明阈值（及其来源）、腔室、是否做了背景校正，以及各片的 `reliability`
+6. `modSE` 应远小于 `MOD`（相对标准误几个百分点以内）；`darkSkipPct` 应接近 0，
+   偏大说明片子脏或有褶皱，先查片子再看数
+7. 报数时说明阈值（及其来源）、腔室、是否做了背景校正，以及各片的 `reliability`

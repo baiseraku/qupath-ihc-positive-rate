@@ -1,8 +1,9 @@
 # qupath-ihc-positive-rate
 
 用 QuPath 0.7 无头模式批量统计免疫组化（IHC / DAB）切片阳性率的可复用流程。
-从**已建好的 QuPath 项目**出发，逐张完成：自动组织检测 → 阳性细胞检测 → 每片一行阳性率 CSV
-+ QC 叠加图（组织轮廓 + 阳性细胞），全程命令行，不需要开 GUI。
+从**已建好的 QuPath 项目**出发，逐张完成：自动组织检测 → 阳性细胞检测 → 每片一行
+阳性率 + IOD/MOD（积分与平均光密度）CSV + QC 叠加图（组织轮廓 + 阳性细胞），
+全程命令行，不需要开 GUI。
 
 ## 项目简介
 
@@ -22,7 +23,7 @@
 | 文件 | 用途 |
 |---|---|
 | `SKILL.md` | 流程说明：环境要求、命令行用法、三个必调参数、结果判读规则、Groovy/QuPath API 坑、验收清单 |
-| `scripts/qupath_ihc_positive_rate.groovy` | **主脚本**。按 QuPath 项目批量执行：图像类型设定 → 背景校正 + 色向量选择 → 自动组织检测 → 阳性细胞检测 → 写 CSV 与 QC 图 |
+| `scripts/qupath_ihc_positive_rate.groovy` | **主脚本**。按 QuPath 项目批量执行：图像类型设定 → 背景校正 + 色向量选择 → 自动组织检测 → 阳性细胞检测 → IOD/MOD 积分 → 写 CSV 与 QC 图 |
 | `scripts/ihc_qc_probe.groovy` | **诊断脚本**。输出背景 RGB 众数、分片估计的 H–DAB 夹角、三种腔室的 DAB OD 分位数与「阈值 → 阳性率」扫描表 |
 
 ## 运行顺序
@@ -49,6 +50,10 @@ S=scripts/qupath_ihc_positive_rate.groovy
 ```bash
 "$QP" script -p /abs/项目/project.qpproj scripts/ihc_qc_probe.groovy
 ```
+
+**关于 IOD**：除阳性率外，每片另出 `IOD`（积分光密度，OD·µm²）与 `MOD`（平均光密度）。
+这组指标不依赖阳性阈值，改 `PIXEL_OD_THRESHOLD` 不影响 `IOD`/`MOD`，适合直接做组间检验。
+⚠️ **IOD 随组织面积缩放**，各片面积不同时要比 `MOD`（已除掉面积），别直接比 `IOD`。
 
 **第 3 步：判读**。先看 `ihc_summary.csv` 的 `estimatedAngleDeg` 与 `reliability` 列
 （≥30° 为 `ok`），再看诊断脚本输出的阈值扫描表是否有平台段。两条都通过，阳性率可直接报告；

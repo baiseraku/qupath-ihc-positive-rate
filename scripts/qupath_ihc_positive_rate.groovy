@@ -17,9 +17,12 @@
  *   [3] COMPARTMENT        阳性判定腔室 Cell|Nucleus|Cytoplasm，默认 Cell
  *   [4] STAIN_MODE         色向量 default|estimate|keep，默认 default
  *   [5] BG_ARG             背景 auto（自动检测）或 "222,222,224"，默认 auto
+ *   [6] PIXEL_OD_THRESHOLD 像素级「DAB 阳性」阈值(OD)，默认 0.20（只影响 IODpos / DABareaPct）
+ *   [7] IOD_TILES           IOD 抽样的瓦片数，默认 100；填 0 关闭 IOD 计算
+ *   [8] DARK_CUTOFF         IOD 排除的近黑像素灰度下限，默认 40；0 = 不排除
  *
  * 产出（写在项目目录下 results/）：
- *   ihc_summary.csv   每片一行：细胞数、组织面积、阳性细胞数、阳性率、色向量 QC
+ *   ihc_summary.csv   每片一行：细胞数、组织面积、阳性细胞数、阳性率、IOD/MOD、色向量 QC
  *   qc/*_qc.jpg       QC 叠加图：绿=自动识别组织轮廓，红=判为阳性的细胞
  *
  * 跑完务必看 estimatedAngleDeg 列：<20° 说明这张片没有可用的 DAB 信号，
@@ -44,6 +47,11 @@ String STAIN_MODE = argv.size() > 4 ? argv[4].toString() : 'default'
 String BG_ARG = argv.size() > 5 ? argv[5].toString() : 'auto'   // auto 或 "222,222,224"
 // 阳性阈值是否由调用方显式给出（默认值只是占位，不是推荐值）
 boolean THRESHOLD_EXPLICIT = argv.size() > 2
+double PIXEL_OD_THRESHOLD = argv.size() > 6 ? (argv[6] as double) : 0.20
+int IOD_TILES = argv.size() > 7 ? (argv[7] as int) : 100
+// 近黑像素（杂质/笔迹/褶皱）的解卷积 OD 可高达 2 以上，远超声真实强阳性（约 0.7），
+// 少量黑点就能把 IOD 显著拉高，故排除。0 = 不排除。
+double DARK_CUTOFF = argv.size() > 8 ? (argv[8] as double) : 40.0
 boolean MAKE_QC = true                 // 输出 QC 叠加图：组织轮廓 + 阳性细胞
 
 // 细胞检测参数（想调就改这里）
@@ -166,6 +174,26 @@ switch (STAIN_MODE) {
 }
 imageData.setColorDeconvolutionStains(stainsUse)
 
+// 色解卷积矩阵求逆。IOD 必须走真正的解卷积（矩阵求逆去串扰），
+// 用点积投影会把苏木素信号算进 DAB，数值虚高。
+def inv3 = { double[][] m ->
+    double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+            m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+            m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    double[][] r = new double[3][3]
+    r[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det
+    r[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det
+    r[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det
+    r[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det
+    r[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det
+    r[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det
+    r[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det
+    r[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det
+    r[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det
+    return r
+}
+def invUse = inv3([vecOf(stainsUse, 1), vecOf(stainsUse, 2), vecOf(stainsUse, 3)] as double[][])
+
 // ---- 3. 清空旧对象，组织检测 ----
 resetSelection()
 removeAnnotations()
@@ -206,7 +234,90 @@ if (anns.isEmpty() || tissueAreaMM2 <= 0) {
 resetSelection()
 fireHierarchyUpdate()
 
-// ---- 5. 阳性率统计 ----
+// ---- 5. IOD（积分光密度）----
+// IOD = 对像素的 DAB 光密度求和，单位 OD·µm²；MOD = IOD ÷ 组织面积（平均光密度）。
+// 逐像素遍历整张片太慢，这里在组织内随机抽样瓦片估计平均 OD，再乘总面积——
+// 统计上等价，同时报告 tiles / SE 供核查抽样是否充分。
+// ⚠️ 负 OD 一律截断为 0：解卷积噪声的负值不该在积分里互相抵消。
+double iod = Double.NaN, mod = Double.NaN
+double iodPos = Double.NaN, modPos = Double.NaN
+double dabAreaPct = Double.NaN, modSE = Double.NaN
+int iodTilesUsed = 0
+long iodPixUsed = 0
+long darkSkip = 0
+if (IOD_TILES > 0 && !anns.isEmpty()) {
+    def roi = anns[0].getROI()
+    double bx = roi.getBoundsX(), by = roi.getBoundsY()
+    double bw = roi.getBoundsWidth(), bh = roi.getBoundsHeight()
+    def rnd = new Random(42)
+    int tileSrc = 2048, dsT = 8
+    // RGB 只有 256 种取值：OD 提前查表，省掉每像素 3 次 log10（实测快 5 倍以上）
+    double[] lutR = new double[256], lutG = new double[256], lutB = new double[256]
+    for (int v = 0; v < 256; v++) {
+        lutR[v] = -Math.log10(Math.max(v, 1) / (double) bgR)
+        lutG[v] = -Math.log10(Math.max(v, 1) / (double) bgG)
+        lutB[v] = -Math.log10(Math.max(v, 1) / (double) bgB)
+    }
+    def tileMeans = []
+    double sumOD = 0.0d, sumODPos = 0.0d
+    long nPos = 0
+    int tries = 0
+    while (iodTilesUsed < IOD_TILES && tries < IOD_TILES * 60) {
+        tries++
+        int x = (int) bx + rnd.nextInt(Math.max(1, (int) bw - tileSrc))
+        int y = (int) by + rnd.nextInt(Math.max(1, (int) bh - tileSrc))
+        if (!roi.contains(x + tileSrc / 2.0d, y + tileSrc / 2.0d)) continue
+        iodTilesUsed++
+        def raw = server.readRegion(RegionRequest.createInstance(server.getPath(), (double) dsT, x, y, tileSrc, tileSrc))
+        def img = new BufferedImage(raw.getWidth(), raw.getHeight(), BufferedImage.TYPE_INT_RGB)
+        def g0 = img.createGraphics(); g0.drawImage(raw, 0, 0, null); g0.dispose()
+        def raster = img.getRaster()
+        int w = img.getWidth(), h = img.getHeight()
+        int[] R = raster.getSamples(0, 0, w, h, 0, (int[]) null)
+        int[] G = raster.getSamples(0, 0, w, h, 1, (int[]) null)
+        int[] B = raster.getSamples(0, 0, w, h, 2, (int[]) null)
+        double tSum = 0.0d
+        int tN = 0
+        for (int i = 0; i < R.length; i++) {
+            int r = R[i], gg = G[i], b = B[i]
+            double mean3 = (r + gg + b) / 3.0d
+            if (mean3 > 235) continue                        // 跳过白背景
+            if (DARK_CUTOFF > 0 && mean3 < DARK_CUTOFF) { darkSkip++; continue }   // 跳过近黑杂质
+            double odr = lutR[r]
+            double odg = lutG[gg]
+            double odb = lutB[b]
+            double dab = invUse[1][0] * odr + invUse[1][1] * odg + invUse[1][2] * odb
+            if (dab < 0) dab = 0.0d
+            tSum += dab; tN++
+            if (dab >= PIXEL_OD_THRESHOLD) { sumODPos += dab; nPos++ }
+        }
+        sumOD += tSum
+        iodPixUsed += tN
+        if (tN > 0) tileMeans << (tSum / tN)
+    }
+    if (iodPixUsed > 0) {
+        double meanOD = sumOD / iodPixUsed
+        double tissueAreaUm2 = tissueAreaMM2 * 1e6
+        iod = meanOD * tissueAreaUm2
+        mod = meanOD
+        if (nPos > 0) {
+            double posAreaUm2 = tissueAreaUm2 * ((double) nPos / iodPixUsed)
+            iodPos = (sumODPos / nPos) * posAreaUm2
+            modPos = sumODPos / nPos
+            dabAreaPct = 100.0d * nPos / iodPixUsed
+        } else {
+            iodPos = 0.0d; dabAreaPct = 0.0d
+        }
+        if (tileMeans.size() > 1) {
+            double mu = tileMeans.sum() / tileMeans.size()
+            // ⚠️ 别把变量叫 var：它是 Groovy 5 的保留字，报错位置会指到几十行之外
+            double variance = tileMeans.collect { (it - mu) * (it - mu) }.sum() / (tileMeans.size() - 1)
+            modSE = Math.sqrt(variance / tileMeans.size())
+        }
+    }
+}
+
+// ---- 6. 阳性率统计 ----
 int nCells = cells.size()
 int nPos = cells.count { it.getPathClass() != null && it.getPathClass().toString() == 'Positive' }
 double posRate = nCells > 0 ? (double) nPos / nCells : Double.NaN
@@ -219,24 +330,36 @@ else if (estInfo.angle < 20.0d) reliability = 'degenerate_angle'
 else if (estInfo.angle < 30.0d) reliability = 'suspect_angle'
 else reliability = 'ok'
 
-// ---- 6. 把汇总写到组织注释上（方便在 GUI 里直接看）----
+// ---- 7. 把汇总写到组织注释上（方便在 GUI 里直接看）----
 anns.each { a ->
     def ml = a.getMeasurementList()
     ml.put('IHC: nCells', nCells as double)
     ml.put('IHC: tissueAreaMM2', tissueAreaMM2)
     ml.put('IHC: positiveRate', posRate)
+    ml.put('IHC: IOD', iod)
+    ml.put('IHC: MOD', mod)
+    ml.put('IHC: DABareaPct', dabAreaPct)
 }
 
-// ---- 7. 追加/更新汇总 CSV（同一张图重跑会覆盖旧行，不产生重复）----
+// ---- 8. 追加/更新汇总 CSV（同一张图重跑会覆盖旧行，不产生重复）----
 def header = ['image', 'nCells', 'tissueAreaMM2', 'nPositive', 'positiveRate',
               'dabPosThreshold', 'compartment', 'nucleusThreshold', 'tissueThreshold',
               'backgroundRGB', 'estimatedAngleDeg', 'reliability', 'thresholdSource',
-              'elapsedSec'] as List
+              'IOD', 'MOD', 'IODpos', 'MODpos', 'DABareaPct', 'pixelODThreshold',
+              'iodTiles', 'darkSkipPct', 'modSE', 'elapsedSec'] as List
 def row = [imageName, nCells, String.format('%.3f', tissueAreaMM2),
            nPos, nCells > 0 ? String.format('%.5f', posRate) : '',
            DAB_POS_THRESHOLD, COMPARTMENT, NUCLEUS_THRESHOLD, TISSUE_THRESHOLD,
            String.format('%d;%d;%d', bgR, bgG, bgB), String.format('%.1f', estInfo.angle),
            reliability, THRESHOLD_EXPLICIT ? 'explicit' : 'default',
+           Double.isNaN(iod) ? '' : String.format('%.1f', iod),
+           Double.isNaN(mod) ? '' : String.format('%.5f', mod),
+           Double.isNaN(iodPos) ? '' : String.format('%.1f', iodPos),
+           Double.isNaN(modPos) ? '' : String.format('%.5f', modPos),
+           Double.isNaN(dabAreaPct) ? '' : String.format('%.3f', dabAreaPct),
+           PIXEL_OD_THRESHOLD, iodTilesUsed,
+           iodPixUsed > 0 ? String.format('%.3f', 100.0d * darkSkip / (iodPixUsed + darkSkip)) : '',
+           Double.isNaN(modSE) ? '' : String.format('%.5f', modSE),
            String.format('%.1f', (System.currentTimeMillis() - t0) / 1000.0d)]
 
 def summaryFile = new File(resultsDir, 'ihc_summary.csv')
@@ -248,7 +371,7 @@ kept.each { outLines << it }
 outLines << row.collect(csvCell).join(',')
 summaryFile.text = outLines.join('\n') + '\n'
 
-// ---- 8. QC 叠加图：低倍底图 + 组织轮廓(绿) + 阳性细胞(红) ----
+// ---- 9. QC 叠加图：低倍底图 + 组织轮廓(绿) + 阳性细胞(红) ----
 if (MAKE_QC) {
     try {
         double qds = Math.max(1.0d, server.getWidth() / 1400.0d)
@@ -279,14 +402,14 @@ if (MAKE_QC) {
     }
 }
 
-// ---- 9. 控制台一行摘要 ----
-def msg = String.format("[IHC] %s | 组织 %.2f mm² | 细胞 %d | 阳性 %d | 阳性率 %.2f%% (阈 %.2f, %s) | 背景RGB(%d,%d,%d) | 夹角 %.1f° | %.0fs",
+// ---- 10. 控制台一行摘要 ----
+def msg = String.format("[IHC] %s | 组织 %.2f mm² | 细胞 %d | 阳性 %d | 阳性率 %.2f%% (阈 %.2f, %s) | IOD %.0f MOD %.5f | DAB面积 %.2f%% | 背景RGB(%d,%d,%d) | 夹角 %.1f° | %.0fs",
         imageName, tissueAreaMM2, nCells, nPos, 100 * posRate, DAB_POS_THRESHOLD, COMPARTMENT,
-        bgR, bgG, bgB, estInfo.angle, (System.currentTimeMillis() - t0) / 1000.0d)
+        iod, mod, dabAreaPct, bgR, bgG, bgB, estInfo.angle, (System.currentTimeMillis() - t0) / 1000.0d)
 println msg
 logger.info(msg)
 
-// ---- 10. 可信度提醒（不中止流程；数值已在上方照常写出）----
+// ---- 11. 可信度提醒（不中止流程；数值已在上方照常写出）----
 if (!THRESHOLD_EXPLICIT) {
     println String.format("[IHC-PARAM] 未显式指定 DAB 阳性阈值，本次用默认 %.3f。" +
             "默认值只是占位、不是推荐值——报告前请确认该阈值是否由阴性对照校准。", DAB_POS_THRESHOLD)
