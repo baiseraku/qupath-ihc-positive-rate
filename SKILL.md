@@ -217,6 +217,7 @@ for (int i = 0; i < 256; i += 5) {
 | 组织面积大得离谱（占全片 1600%） | `ROI.getArea()` 单位是**全分辨率像素²**，要乘 `pixelWidthMicrons * pixelHeightMicrons` 才是 µm² |
 | `No signature of method: getBounds()` | QuPath 的 ROI 没有 `getBounds()` / `getInteriorPoint()`，用 `getBoundsX()/getBoundsY()/getBoundsWidth()/getBoundsHeight()` |
 | `No signature of method: getMeasurementValue(String)` | 0.7 的测量表是 `NumericMeasurementList`，用 `.get(name)` 取值、`.getNames()` 取名字 |
+| 改完脚本做语法检查后，脚本同级多出 `.class` 文件 | Groovy 的 `CompilationUnit` / `GroovyShell` 默认把编译产物写到**当前工作目录**。检查前先 `cd` 到临时目录（如 `/tmp`），提交前确认 `git status`；`.gitignore` 里已备好 `*.class` |
 | 变量名取 `var`，报错行号指向几十行之外的注释行 | `var` 是 Groovy 5 的保留字。改个名（如 `variance`）即可，**别去报错指的那一行找问题**——它指的是解析器放弃的位置，不是出错位置 |
 | 闭包里的变量莫名报 `MissingPropertyException`，且被 catch 吞掉 | Groovy 闭包**不能前向引用**后面才 `def` 的局部变量。闭包定义在变量声明之前就会失败——把该变量当**显式参数**传进去 |
 | `String.format("%d", x)` 抛 `d != java.math.BigDecimal` | Groovy 里 `Integer / Integer` 结果是 BigDecimal。用 `.intdiv()` 或先转 double |
