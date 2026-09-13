@@ -16,3 +16,6 @@ qc/
 # 编辑期临时文件
 _probe*.txt
 *.bak
+
+# Groovy 编译产物（CompilationUnit / GroovyShell 会把 .class 写到当前目录）
+*.class
