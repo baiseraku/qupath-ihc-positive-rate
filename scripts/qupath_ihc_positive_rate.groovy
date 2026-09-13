@@ -363,13 +363,44 @@ def row = [imageName, nCells, String.format('%.3f', tissueAreaMM2),
            String.format('%.1f', (System.currentTimeMillis() - t0) / 1000.0d)]
 
 def summaryFile = new File(resultsDir, 'ihc_summary.csv')
-def lines = summaryFile.exists() ? summaryFile.readLines() : []
-def kept = lines.findAll { it.trim() && !it.startsWith('image,') }
-kept.removeAll { it.startsWith(csvCell(imageName) + ',') }
-def outLines = [header.join(',')]
-kept.each { outLines << it }
-outLines << row.collect(csvCell).join(',')
-summaryFile.text = outLines.join('\n') + '\n'
+def headerLine = header.join(',')
+
+// ⚠️ 表头变更时必须丢弃旧行，不能与新行混在同一文件里：
+// 旧行的列按新表头解析会整体错位（例如旧表头第 14 列是 elapsedSec，
+// 新表头第 14 列是 IOD，耗时会被读成积分光密度）。中途读文件的人拿到的是错位数据。
+// 旧文件先备份再从空开始，不丢数据。
+def kept = []
+if (summaryFile.exists()) {
+    def all = summaryFile.readLines().findAll { it.trim() }
+    if (!all.isEmpty() && all[0] == headerLine) {
+        // 表头一致：保留其它图的行，删掉本图旧行（重跑覆盖，不产生重复）
+        kept = all.tail().findAll { !it.startsWith(csvCell(imageName) + ',') }
+    } else if (!all.isEmpty()) {
+        def stamp = new java.text.SimpleDateFormat('yyyyMMdd-HHmmss').format(new Date())
+        def legacy = new File(resultsDir, "ihc_summary_legacy_${stamp}.csv")
+        summaryFile.renameTo(legacy)
+        def notice = String.format("[IHC-CSV] %s: 表头与当前脚本不一致，旧文件已备份为 %s，" +
+                "本次从空开始重建（避免新旧行列错位）", imageName, legacy.getName())
+        println notice
+        logger.warn(notice)
+    }
+}
+// 数据行按行首（图名）排序：重跑某张图不会把它的行挪到末尾，
+// 文件在多次运行之间保持稳定，可以直接 diff。
+def dataLines = (kept + [row.collect(csvCell).join(',')]).sort()
+def outLines = [headerLine] + dataLines
+
+// 原子写：先写 .tmp 再改名。直接覆写会让并发读取者读到半截文件。
+def tmpFile = new File(resultsDir, 'ihc_summary.csv.tmp')
+tmpFile.text = outLines.join('\n') + '\n'
+try {
+    java.nio.file.Files.move(tmpFile.toPath(), summaryFile.toPath(),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+} catch (Throwable t) {
+    summaryFile.text = tmpFile.text
+    tmpFile.delete()
+}
 
 // ---- 9. QC 叠加图：低倍底图 + 组织轮廓(绿) + 阳性细胞(红) ----
 if (MAKE_QC) {
